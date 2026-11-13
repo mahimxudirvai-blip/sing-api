@@ -1,10 +1,11 @@
 "use strict";
-// sing-api — best working version. YouTube (yt-dlp) first, JioSaavn fallback.
-// Zero npm dependencies (Node builtins only).
+// sing-api — best working version. Raw JioSaavn first, YouTube (yt-dlp) fallback.
+// Zero npm dependencies (Node builtins only). Run with --openssl-legacy-provider
+// (DES-ECB, needed to decrypt Saavn media URLs, needs the legacy provider on Node 20+).
 //
-//   GET /sing?q=<song>        -> audio bytes directly (yt-dlp stream, or Saavn redirect)
+//   GET /sing?q=<song>        -> audio bytes directly (Saavn 302 redirect, or yt-dlp stream)
 //   GET /sing?q=<song>&info=1 -> JSON { ok, title, artist, duration, source }
-//   GET /health               -> { ok: true, ytdlp, cookies, proxy, deno }
+//   GET /health               -> { ok: true, ytdlp, cookies, proxy, deno, des }
 //
 // Env:
 //   PORT            (Railway sets this automatically)
@@ -12,10 +13,10 @@
 //   DENO_PATH       (default: /usr/local/bin/deno)
 //   YTDLP_PROXY     (residential proxy URL — fixes YouTube 403 on datacenter IPs)
 //   YTDLP_COOKIES   (cookie file contents — saved to /tmp at startup, never logged)
-//   SAAVN_API_URL   (override the Saavn fallback endpoint)
 
 const http = require("http");
 const { spawn } = require("child_process");
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -36,15 +37,115 @@ if (process.env.YTDLP_COOKIES) {
 }
 if (COOKIE_FILE && !fs.existsSync(COOKIE_FILE)) COOKIE_FILE = "";
 
-const SAAVN_ENDPOINTS = process.env.SAAVN_API_URL
-	? [process.env.SAAVN_API_URL]
-	: ["https://jio.shnwaz.dev/api/search/songs", "https://saavn.dev/api/search/songs"];
 const SEARCH_TIMEOUT_MS = 30000;
 const SAAVN_TIMEOUT_MS = 10000;
 const FIRST_BYTE_TIMEOUT_MS = 30000;
 
+// JioSaavn encrypts media URLs with DES-ECB (static key, well known).
+const SAAVN_DES_KEY = Buffer.from("38346591", "utf8");
+
 let ytdlpOK = false;
+let desOK = false;
 spawn(YTDLP, ["--version"], { stdio: "ignore" }).on("close", (code) => { ytdlpOK = code === 0; });
+try {
+	crypto.createDecipheriv("des-ecb", SAAVN_DES_KEY, null);
+	desOK = true;
+} catch { desOK = false; }
+
+function words(s) {
+	return s.toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter(Boolean);
+}
+
+// Fraction of query words in the title, with a bonus for official uploads.
+function scoreTitle(query, title) {
+	const q = words(query);
+	if (!q.length) return 0;
+	const t = new Set(words(title));
+	let score = q.filter((w) => t.has(w)).length / q.length;
+	const lower = title.toLowerCase();
+	if (lower.includes("official")) score += 0.15;
+	if (lower.includes("music video")) score += 0.1;
+	return score;
+}
+
+function decodeEntities(s) {
+	return String(s || "")
+		.replace(/&quot;/g, '"')
+		.replace(/&#039;/g, "'")
+		.replace(/&amp;/g, "&")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">");
+}
+
+async function fetchJson(url, timeoutMs, headers) {
+	const ctrl = new AbortController();
+	const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+	try {
+		const res = await fetch(url, { signal: ctrl.signal, headers });
+		if (!res.ok) throw new Error(`HTTP ${res.status}`);
+		return await res.json();
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+// --- JioSaavn (primary source — one HTTP call, direct 320kbps MP3) ---
+
+function decryptSaavnUrl(encrypted) {
+	const decipher = crypto.createDecipheriv("des-ecb", SAAVN_DES_KEY, null);
+	const out = Buffer.concat([
+		decipher.update(Buffer.from(encrypted, "base64")),
+		decipher.final()
+	]).toString("utf8").trim();
+	return out || null;
+}
+
+async function searchSaavn(query) {
+	const url = "https://www.jiosaavn.com/api.php?__call=search.getResults" +
+		`&_format=json&api_version=4&q=${encodeURIComponent(query)}&n=10&p=1`;
+	const json = await fetchJson(url, SAAVN_TIMEOUT_MS, {
+		"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+		"Referer": "https://www.jiosaavn.com/"
+	});
+	const results = (json && json.results) || [];
+	let best = null;
+	let bestScore = 0;
+	for (const r of results) {
+		if (!r || r.type !== "song") continue;
+		const info = r.more_info || {};
+		if (!info.encrypted_media_url) continue;
+		const title = decodeEntities(r.title || "");
+		const artist = decodeEntities(r.subtitle || info.music || "");
+		// Score title + artist together, so "perfect ed sheeran" matches.
+		// Word match + exact-title bonus + small popularity tie-break.
+		let s = scoreTitle(query, `${title} ${artist}`.trim());
+		const cleaned = title.replace(/\s*\([^)]*\)\s*/g, "").trim().toLowerCase();
+		if (cleaned === query.trim().toLowerCase()) s += 0.3;
+		const plays = Number(r.play_count) || 0;
+		if (plays > 0) s += Math.min(0.1, Math.log10(plays + 1) * 0.01);
+		if (s > bestScore) { bestScore = s; best = { r, info, title }; }
+	}
+	if (!best || bestScore < 0.5) return null;
+	let audioUrl;
+	try {
+		audioUrl = decryptSaavnUrl(best.info.encrypted_media_url);
+	} catch {
+		return null;
+	}
+	if (!audioUrl) return null;
+	// The decrypted URL is 96kbps — upgrade to 320kbps when the track has it.
+	if (best.info["320kbps"] === "true" && audioUrl.endsWith("_96.mp4")) {
+		audioUrl = audioUrl.slice(0, -"_96.mp4".length) + "_320.mp4";
+	}
+	return {
+		title: best.title || "Unknown",
+		artist: decodeEntities(best.r.subtitle || best.info.music || "Unknown"),
+		duration: Number(best.info.duration) || null,
+		audioUrl
+	};
+}
+
+// --- YouTube via yt-dlp (fallback) ---
 
 function baseArgs() {
 	const args = ["--ignore-config", "--no-warnings", "--no-playlist"];
@@ -81,22 +182,6 @@ function runYtDlp(args, timeoutMs) {
 	});
 }
 
-function words(s) {
-	return s.toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter(Boolean);
-}
-
-// Fraction of query words in the title, with a bonus for official uploads.
-function scoreTitle(query, title) {
-	const q = words(query);
-	if (!q.length) return 0;
-	const t = new Set(words(title));
-	let score = q.filter((w) => t.has(w)).length / q.length;
-	const lower = title.toLowerCase();
-	if (lower.includes("official")) score += 0.15;
-	if (lower.includes("music video")) score += 0.1;
-	return score;
-}
-
 async function searchYouTube(query) {
 	const raw = await runYtDlp([...baseArgs(), "--flat-playlist", "-J", `ytsearch3:${query}`], SEARCH_TIMEOUT_MS);
 	const data = JSON.parse(raw);
@@ -118,7 +203,7 @@ async function searchYouTube(query) {
 }
 
 // Streams yt-dlp's stdout to the client. Resolves true if audio flowed,
-// false (+ error text) if yt-dlp failed before the first byte.
+// false if yt-dlp failed before the first byte.
 function streamYouTube(res, song) {
 	return new Promise((resolve) => {
 		const child = spawn(YTDLP, [
@@ -163,70 +248,8 @@ function streamYouTube(res, song) {
 			else { res.end(); finish(true); }
 		});
 		res.on("close", () => { try { child.kill("SIGKILL"); } catch {} });
-
-		// Expose the failure details to the caller.
-		child._getStderr = () => stderr.trim().slice(-500);
 		res._ytDlpStderr = () => stderr.trim().slice(-500);
 	});
-}
-
-async function fetchJson(url, timeoutMs) {
-	const ctrl = new AbortController();
-	const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-	try {
-		const res = await fetch(url, { signal: ctrl.signal, headers: { "User-Agent": "sing-api/1.0" } });
-		if (!res.ok) throw new Error(`HTTP ${res.status}`);
-		return await res.json();
-	} finally {
-		clearTimeout(timer);
-	}
-}
-
-function bestAudioUrl(song) {
-	const links = song.downloadUrl;
-	if (typeof links === "string") return links;
-	if (!Array.isArray(links) || !links.length) return null;
-	let best = null;
-	let bestKbps = -1;
-	for (const l of links) {
-		if (!l || !l.url) continue;
-		const m = /(\d+)\s*kbps/i.exec(l.quality || "");
-		const kbps = m ? Number(m[1]) : 0;
-		if (kbps >= bestKbps) { bestKbps = kbps; best = l.url; }
-	}
-	return best;
-}
-
-async function searchSaavn(query) {
-	for (const base of SAAVN_ENDPOINTS) {
-		try {
-			const json = await fetchJson(`${base}?query=${encodeURIComponent(query)}`, SAAVN_TIMEOUT_MS);
-			const data = json && json.data;
-			const results = ((data && data.results) || json.results || (Array.isArray(data) ? data : []) || [])
-				.filter((r) => r && (r.name || r.title));
-			let best = null;
-			let bestScore = 0;
-			for (const r of results) {
-				const s = scoreTitle(query, r.name || r.title || "");
-				if (s > bestScore) { bestScore = s; best = r; }
-			}
-			if (best && bestScore >= 0.5) {
-				const audioUrl = bestAudioUrl(best);
-				if (!audioUrl) return null;
-				const artists = best.artists && best.artists.primary;
-				return {
-					title: best.name || best.title || "Unknown",
-					artist: (Array.isArray(artists) && artists.length)
-						? artists.map((a) => a.name).filter(Boolean).join(", ") || "Unknown"
-						: (best.artist || best.singers || "Unknown"),
-					duration: best.duration || null,
-					audioUrl
-				};
-			}
-			return null; // answered but no match — don't try the other instance
-		} catch { /* try the next instance */ }
-	}
-	return null;
 }
 
 function sendJson(res, status, obj) {
@@ -250,7 +273,8 @@ const server = http.createServer(async (req, res) => {
 			ytdlp: ytdlpOK,
 			cookies: Boolean(COOKIE_FILE),
 			proxy: Boolean(PROXY),
-			deno: fs.existsSync(DENO)
+			deno: fs.existsSync(DENO),
+			des: desOK
 		});
 	}
 	if (u.pathname !== "/sing") {
@@ -261,28 +285,13 @@ const server = http.createServer(async (req, res) => {
 	if (!q) {
 		return sendJson(res, 400, { ok: false, error: "Missing q — e.g. /sing?q=perfect" });
 	}
+	const infoOnly = u.searchParams.get("info") === "1";
 
-	// 1. YouTube via yt-dlp.
-	try {
-		const song = await searchYouTube(q);
-		if (song) {
-			if (u.searchParams.get("info") === "1") {
-				return sendJson(res, 200, { ok: true, ...song, source: "youtube" });
-			}
-			const ok = await streamYouTube(res, song);
-			if (ok) return; // streamed — response already finished
-			// yt-dlp failed before the first byte (e.g. 403) — fall through to Saavn.
-			var ytError = res._ytDlpStderr ? res._ytDlpStderr() : "YouTube download failed";
-		}
-	} catch (e) {
-		var ytError = e.message;
-	}
-
-	// 2. JioSaavn fallback.
+	// 1. JioSaavn first — fast, free, no yt-dlp, no proxy needed.
 	try {
 		const song = await searchSaavn(q);
 		if (song) {
-			if (u.searchParams.get("info") === "1") {
+			if (infoOnly) {
 				return sendJson(res, 200, { ok: true, ...song, source: "saavn" });
 			}
 			res.writeHead(302, {
@@ -294,12 +303,27 @@ const server = http.createServer(async (req, res) => {
 			});
 			return res.end();
 		}
-	} catch { /* fall through to the error below */ }
+	} catch { /* fall through to YouTube */ }
+
+	// 2. YouTube via yt-dlp.
+	try {
+		const song = await searchYouTube(q);
+		if (song) {
+			if (infoOnly) {
+				return sendJson(res, 200, { ok: true, ...song, source: "youtube" });
+			}
+			const ok = await streamYouTube(res, song);
+			if (ok) return; // streamed — response already finished
+			var ytError = res._ytDlpStderr ? res._ytDlpStderr() : "YouTube download failed";
+		}
+	} catch (e) {
+		var ytError = e.message;
+	}
 
 	return sendJson(res, 502, {
 		ok: false,
 		error: "No working source for this song",
-		details: (typeof ytError === "string" ? ytError : "YouTube and Saavn both failed").slice(-500)
+		details: (typeof ytError === "string" ? ytError : "Saavn and YouTube both failed").slice(-500)
 	});
 });
 

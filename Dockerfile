@@ -20,4 +20,5 @@ COPY . .
 # Railway sets PORT at runtime; 3000 is the local default.
 EXPOSE 3000
 
-CMD ["node", "index.js"]
+# DES-ECB (Saavn URL decryption) needs the legacy OpenSSL provider on Node 20+.
+CMD ["node", "--openssl-legacy-provider", "index.js"]

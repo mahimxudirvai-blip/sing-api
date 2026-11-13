@@ -2,11 +2,11 @@
   "name": "sing-api",
   "version": "1.0.0",
   "private": true,
-  "description": "Best working sing API \u2014 yt-dlp (YouTube) first, JioSaavn fallback. Zero dependencies.",
+  "description": "Best working sing API \u2014 raw JioSaavn first, yt-dlp (YouTube) fallback. Zero dependencies.",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node --openssl-legacy-provider index.js"
   },
   "engines": {
     "node": ">=20"
