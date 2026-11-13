@@ -1,0 +1,7 @@
+node_modules
+.git
+cookies.txt
+*.m4a
+*.mp3
+*.opus
+downloads/
