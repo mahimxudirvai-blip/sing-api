@@ -51,8 +51,10 @@ function baseArgs() {
 	if (fs.existsSync(DENO)) args.push("--js-runtimes", `deno:${DENO}`);
 	if (COOKIE_FILE) args.push("--cookies", COOKIE_FILE);
 	if (PROXY) args.push("--proxy", PROXY);
-	// The Android client often bypasses the web 403 on datacenter IPs.
-	args.push("--extractor-args", "youtube:player_client=android,web");
+	// TV client first: it returns playable formats without a PO token
+	// where android/web return none on datacenter IPs. Falls through to
+	// android, iOS, then web.
+	args.push("--extractor-args", "youtube:player_client=tv,android,ios,web");
 	return args;
 }
 
