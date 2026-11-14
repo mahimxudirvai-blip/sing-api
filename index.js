@@ -5,6 +5,9 @@
 //
 //   GET /sing?q=<song>        -> audio bytes directly (Saavn 302 redirect, or yt-dlp stream)
 //   GET /sing?q=<song>&info=1 -> JSON { ok, title, artist, duration, source }
+//   GET /sing?q=<song>&duration=<seconds> -> prefer a candidate whose
+//       length is close to the target (the bot passes the YouTube
+//       video's duration: a 112s cut of a 296s song is not the song)
 //   GET /health               -> { ok: true, ytdlp, cookies, proxy, deno, des }
 //
 // Env:
@@ -46,7 +49,9 @@ const SAAVN_DES_KEY = Buffer.from("38346591", "utf8");
 
 let ytdlpOK = false;
 let desOK = false;
-spawn(YTDLP, ["--version"], { stdio: "ignore" }).on("close", (code) => { ytdlpOK = code === 0; });
+spawn(YTDLP, ["--version"], { stdio: "ignore" })
+	.on("close", (code) => { ytdlpOK = code === 0; })
+	.on("error", () => { ytdlpOK = false; }); // yt-dlp missing: Saavn still works
 try {
 	crypto.createDecipheriv("des-ecb", SAAVN_DES_KEY, null);
 	desOK = true;
@@ -100,7 +105,46 @@ function decryptSaavnUrl(encrypted) {
 	return out || null;
 }
 
-async function searchSaavn(query) {
+// Version words that mark a non-original recording (a reprise, a
+// cover, a remix…). Penalised unless the query itself asks for one —
+// "pasoori reprise" should still match the reprise.
+const VERSION_WORDS = ["reprise", "cover", "remix", "karaoke", "lofi", "lo-fi", "unplugged", "acoustic", "slowed", "reverb", "sped up"];
+
+/**
+ * Score one Saavn candidate. Word match + exact-title bonus +
+ * popularity tie-break, then:
+ *   - duration: +0.5 within 5s of the target, +0.3 within 15s,
+ *     -0.3 when more than 60s off (the robust original-vs-cut
+ *     signal — the bot knows the YouTube video's length);
+ *   - version: -0.4 when the title carries a version word the query
+ *     did not ask for;
+ *   - unknown artist: -0.2 (Saavn failed to attribute it).
+ */
+function scoreSaavnCandidate(query, cand, opts = {}) {
+	const q = String(query || "");
+	const title = String((cand && cand.title) || "");
+	const artist = String((cand && cand.artist) || "");
+	let s = scoreTitle(q, `${title} ${artist}`.trim());
+	const cleaned = title.replace(/\s*\([^)]*\)\s*/g, "").trim().toLowerCase();
+	if (cleaned === q.trim().toLowerCase()) s += 0.3;
+	const plays = Number(cand && cand.playCount) || 0;
+	if (plays > 0) s += Math.min(0.1, Math.log10(plays + 1) * 0.01);
+	const target = Number(opts && opts.targetDuration);
+	const dur = Number(cand && cand.duration);
+	if (Number.isFinite(target) && target > 0 && Number.isFinite(dur) && dur > 0) {
+		const diff = Math.abs(dur - target);
+		if (diff <= 5) s += 0.5;
+		else if (diff <= 15) s += 0.3;
+		else if (diff > 60) s -= 0.3;
+	}
+	const qLower = q.toLowerCase();
+	const tLower = title.toLowerCase();
+	if (VERSION_WORDS.some(w => tLower.includes(w) && !qLower.includes(w))) s -= 0.4;
+	if (!artist || artist.toLowerCase() === "unknown") s -= 0.2;
+	return s;
+}
+
+async function searchSaavn(query, opts = {}) {
 	const url = "https://www.jiosaavn.com/api.php?__call=search.getResults" +
 		`&_format=json&api_version=4&q=${encodeURIComponent(query)}&n=10&p=1`;
 	const json = await fetchJson(url, SAAVN_TIMEOUT_MS, {
@@ -117,12 +161,12 @@ async function searchSaavn(query) {
 		const title = decodeEntities(r.title || "");
 		const artist = decodeEntities(r.subtitle || info.music || "");
 		// Score title + artist together, so "perfect ed sheeran" matches.
-		// Word match + exact-title bonus + small popularity tie-break.
-		let s = scoreTitle(query, `${title} ${artist}`.trim());
-		const cleaned = title.replace(/\s*\([^)]*\)\s*/g, "").trim().toLowerCase();
-		if (cleaned === query.trim().toLowerCase()) s += 0.3;
-		const plays = Number(r.play_count) || 0;
-		if (plays > 0) s += Math.min(0.1, Math.log10(plays + 1) * 0.01);
+		const s = scoreSaavnCandidate(query, {
+			title,
+			artist,
+			duration: Number(info.duration) || null,
+			playCount: Number(r.play_count) || 0
+		}, opts);
 		if (s > bestScore) { bestScore = s; best = { r, info, title }; }
 	}
 	if (!best || bestScore < 0.5) return null;
@@ -286,10 +330,14 @@ const server = http.createServer(async (req, res) => {
 		return sendJson(res, 400, { ok: false, error: "Missing q — e.g. /sing?q=perfect" });
 	}
 	const infoOnly = u.searchParams.get("info") === "1";
+	// Optional target duration (seconds) from the bot — the YouTube
+	// video's length. Ignored when missing or invalid.
+	const targetDuration = Number(u.searchParams.get("duration"));
+	const durationOpt = Number.isFinite(targetDuration) && targetDuration > 0 ? targetDuration : null;
 
 	// 1. JioSaavn first — fast, free, no yt-dlp, no proxy needed.
 	try {
-		const song = await searchSaavn(q);
+		const song = await searchSaavn(q, durationOpt ? { targetDuration: durationOpt } : {});
 		if (song) {
 			if (infoOnly) {
 				return sendJson(res, 200, { ok: true, ...song, source: "saavn" });
@@ -327,6 +375,12 @@ const server = http.createServer(async (req, res) => {
 	});
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-	console.log(`sing-api listening on port ${PORT}`);
-});
+// Only listen when run directly (node index.js). Requiring the
+// module (tests) must not start a server.
+if (require.main === module) {
+	server.listen(PORT, "0.0.0.0", () => {
+		console.log(`sing-api listening on port ${PORT}`);
+	});
+}
+
+module.exports = { scoreSaavnCandidate, scoreTitle, searchSaavn };
