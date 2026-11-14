@@ -85,6 +85,65 @@ async function main() {
 		assert.ok(Math.abs((unknown - plain) - (-0.2)) < 1e-9, `expected -0.2, got ${unknown - plain}`);
 	});
 
+	await test("scoring: an empty artist is NOT penalised (Saavn leaves it blank)", () => {
+		const plain = scoreSaavnCandidate("Pasoori", base, {});
+		const empty = scoreSaavnCandidate("Pasoori", { ...base, artist: "" }, {});
+		assert.ok(Math.abs(empty - plain) < 1e-9, `expected no penalty, got ${empty - plain}`);
+	});
+
+	await test("scoring: an Artist Title query gives the title-suffix bonus", () => {
+		const cand = { title: "Pasoori", artist: "", duration: 0, playCount: 0 };
+		const suffix = scoreSaavnCandidate("Ali Sethi Pasoori", cand, {});
+		const reversed = scoreSaavnCandidate("Pasoori Ali Sethi", cand, {});
+		assert.ok(Math.abs((suffix - reversed) - 0.3) < 1e-9, `expected +0.3, got ${suffix - reversed}`);
+		// The suffix bonus lifts a perfect title match above the 0.5
+		// searchSaavn threshold (without it the 3-word query caps at 1/3).
+		assert.ok(suffix >= 0.5, `artist-prefixed title match must clear 0.5, got ${suffix}`);
+	});
+
+	await test("searchSaavn: artist-prefixed query with no original in the results still returns a full-length track", async () => {
+		const savedFetch = globalThis.fetch;
+		try {
+			// Fixture mirrors Saavn's live top results for "Pasoori"
+			// (2026-11-14): the reprise is first, the Ali Sethi
+			// original is NOT among them, most artists are blank.
+			const mk = (title, subtitle, playCount, duration, tag) => ({
+				type: "song",
+				title,
+				subtitle,
+				play_count: String(playCount),
+				more_info: {
+					encrypted_media_url: encryptSaavnUrl(`https://aac.saavncdn.com/${tag}_96.mp4`),
+					duration: String(duration),
+					"320kbps": "true"
+				}
+			});
+			const results = [
+				mk("Pasoori (Reprise)", "JalRaj", 204703, 181, "reprise"),
+				mk("Pasoori", "", 2574, 153, "v153"),
+				mk("Pasoori", "Angel", 13681, 208, "v208"),
+				mk("Pasoori", "", 33, 237, "v237"),
+				mk("Pasoori", "Dream Reverb", 92, 221, "v221")
+			];
+			globalThis.fetch = async () => ({
+				ok: true,
+				status: 200,
+				json: async () => ({ results })
+			});
+			const song = await searchSaavn("Ali Sethi Pasoori", { targetDuration: 277 });
+			assert.ok(song, "must return a song, not null (null falls to the dead YouTube stream)");
+			assert.strictEqual(song.title, "Pasoori");
+			// Closest full-length non-version track wins (221s, Dream
+			// Reverb); the reprise must never win.
+			assert.strictEqual(song.duration, 221);
+			assert.strictEqual(song.artist, "Dream Reverb");
+			assert.ok(song.audioUrl.includes("v221_320.mp4"), `got ${song.audioUrl}`);
+		}
+		finally {
+			globalThis.fetch = savedFetch;
+		}
+	});
+
 	await test("searchSaavn: with duration=277 the Ali Sethi original beats the JalRaj reprise", async () => {
 		const savedFetch = globalThis.fetch;
 		try {

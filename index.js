@@ -126,7 +126,13 @@ function scoreSaavnCandidate(query, cand, opts = {}) {
 	const artist = String((cand && cand.artist) || "");
 	let s = scoreTitle(q, `${title} ${artist}`.trim());
 	const cleaned = title.replace(/\s*\([^)]*\)\s*/g, "").trim().toLowerCase();
-	if (cleaned === q.trim().toLowerCase()) s += 0.3;
+	const qClean = q.trim().toLowerCase();
+	// Exact title, or the title as the trailing words of an
+	// "Artist Title" query (the bot always queries that way) — without
+	// this, a 3-word query caps a perfect title match at 1/3 and Saavn
+	// returns null, falling through to the dead YouTube stream path.
+	if (cleaned === qClean) s += 0.3;
+	else if (cleaned.length >= 3 && qClean.endsWith(` ${cleaned}`)) s += 0.3;
 	const plays = Number(cand && cand.playCount) || 0;
 	if (plays > 0) s += Math.min(0.1, Math.log10(plays + 1) * 0.01);
 	const target = Number(opts && opts.targetDuration);
@@ -140,7 +146,10 @@ function scoreSaavnCandidate(query, cand, opts = {}) {
 	const qLower = q.toLowerCase();
 	const tLower = title.toLowerCase();
 	if (VERSION_WORDS.some(w => tLower.includes(w) && !qLower.includes(w))) s -= 0.4;
-	if (!artist || artist.toLowerCase() === "unknown") s -= 0.2;
+	// Only a literal "Unknown" artist is penalised: Saavn leaves the
+	// artist fields empty for most results (verified live 2026-11-14),
+	// so an empty artist is a data gap, not a bad recording.
+	if (artist.toLowerCase() === "unknown") s -= 0.2;
 	return s;
 }
 
